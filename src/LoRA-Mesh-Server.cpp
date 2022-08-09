@@ -6,6 +6,7 @@
  */
 
 // v1 - Initial attempt - no sleeping but disconnects when not sending data
+// v2 - Rough working example for a gateway and a single node
 
 /*
 payload[0] = 0;                             // to be replaced/updated
@@ -32,7 +33,7 @@ payload[16] = msgCnt++;						// Sequential message number
 #include "PublishQueuePosixRK.h"			// https://github.com/rickkas7/PublishQueuePosixRK
 #include "LocalTimeRK.h"					// https://rickkas7.github.io/LocalTimeRK/
 
-const uint8_t firmware = 1;
+const uint8_t firmware = 2;
 
 // Mesh has much greater memory requirements, and you may need to limit the
 // max message length to prevent wierd crashes
@@ -59,13 +60,14 @@ SerialLogHandler logHandler(LOG_LEVEL_INFO, { // Logging level for non-applicati
 // Prototype functions
 void publishStateTransition(void);
 void stayAwakeTimerISR(void);
+int setFrequency(String command);
+int setLowPowerMode(String command);
 
 // State Machine Variables
-enum State { INITIALIZATION_STATE, ERROR_STATE, IDLE_STATE, SLEEPING_STATE, NAPPING_STATE, CONNECTING_STATE, REPORTING_STATE, RESP_WAIT_STATE, FIRMWARE_UPDATE};
-char stateNames[9][16] = {"Initialize", "Error", "Idle", "Sleeping", "Napping", "Connecting", "Reporting", "Response Wait", "Firmware Update"};
+enum State { INITIALIZATION_STATE, ERROR_STATE, IDLE_STATE, SLEEPING_STATE, LoRA_STATE, CONNECTING_STATE, DISCONNECTING_STATE, REPORTING_STATE};
+char stateNames[9][16] = {"Initialize", "Error", "Idle", "Sleeping", "LoRA", "Connecting", "Disconnecting", "Reporting"};
 State state = INITIALIZATION_STATE;
 State oldState = INITIALIZATION_STATE;
-Timer stayAwakeTimer(90000, stayAwakeTimerISR, true);      // This is how we will ensure the device stays connected for 90 seconds
 LocalTimeSchedule publishSchedule;							// These allow us to enable a schedule and to use local time
 LocalTimeConvert conv;
 
@@ -92,13 +94,18 @@ uint8_t buf[RH_MESH_MAX_MESSAGE_LEN];
 // Variables
 const int wakeBoundary = 0*3600 + 5*60 + 0;         // Sets how often we connect to Particle
 time_t lastConnectTime = 0;
-volatile bool disconnectFlag = false;
-
-
+uint16_t frequencyMinutes = 2;						// Default settings both these can be adjusted via Particle functions
+uint16_t updatedFrequencyMinutes = 0;
+bool lowPowerMode = false;						
 
 void setup() 
 {
 	pinMode(blueLED,OUTPUT);
+
+	Particle.variable("Report Frequency", frequencyMinutes);
+
+	Particle.function("LowPower Mode",setLowPowerMode);
+	Particle.function("Set Frequency",setFrequency);
 
 	if (!manager.init()) Log.info("init failed");	// Defaults after init are 434.0MHz, 0.05MHz AFC pull-in, modulation FSK_Rb2_4Fd36
 
@@ -117,13 +124,13 @@ void setup()
 			lastConnectTime = Time.now();			// Record the last connection time
 			Particle.syncTime();					// Sync time
 			waitUntil(Particle.syncTimeDone);		// Makr sure sync is complete
-			disconnectFlag = true;					// Raise the disconnect flag - will get serviced in main loop
+			if (lowPowerMode) state = DISCONNECTING_STATE;
 		}
 	}
 	// Setup local time and set the publishing schedule
 	LocalTime::instance().withConfig(LocalTimePosixTimezone("EST5EDT,M3.2.0/2:00:00,M11.1.0/2:00:00"));			// East coast of the US
 	conv.withCurrentTime().convert();  				// Convert to local time for use later
-    publishSchedule.withMinuteOfHour(15, LocalTimeRange(LocalTimeHMS("06:00:00"), LocalTimeHMS("21:59:59")));	 // Publish every 15 minutes from 6am to 10pm
+    publishSchedule.withMinuteOfHour(frequencyMinutes, LocalTimeRange(LocalTimeHMS("06:00:00"), LocalTimeHMS("21:59:59")));	 // Publish every 15 minutes from 6am to 10pm
 
     Log.info("Startup complete at %s with battery %4.2f", conv.format(TIME_FORMAT_ISO8601_FULL).c_str(), System.batteryCharge());
 
@@ -139,22 +146,61 @@ void loop() {
 		case IDLE_STATE: {
 			if (state != oldState) publishStateTransition();                   // We will apply the back-offs before sending to ERROR state - so if we are here we will take action
 			
+			if (publishSchedule.isScheduledTime()) state = LoRA_STATE;		   // See Time section in setup for schedule
+
+		} break;
+
+		case SLEEPING_STATE:
+			if (state != oldState) publishStateTransition();                   // We will apply the back-offs before sending to ERROR state - so if we are here we will take action
+
+			// if Sleep is enabled, it will occur here - will add a sleep enable particle function
+			// Will also look at the low power state
+
+			state = IDLE_STATE;
+
+		break;
+
+		case LoRA_STATE: {
+			static time_t startLoRAWindow;
+
+			if (state != oldState) {
+				publishStateTransition();                   // We will apply the back-offs before sending to ERROR state - so if we are here we will take action
+
+				// Here is where we will power up the LoRA radio module
+
+				startLoRAWindow = Time.now();
+			} 
+
 			if (manager.recvfromAck(buf, &len, &from))	{	// We have received a message
 				digitalWrite(blueLED,HIGH);			// Signal we are using the radio
 				buf[len] = 0;
 				Log.info("Received from 0x%02x with rssi=%d msg = %d", from, driver.lastRssi(), buf[16]);
-		
+
+				if (updatedFrequencyMinutes) {
+					frequencyMinutes = updatedFrequencyMinutes;
+					updatedFrequencyMinutes = 0;
+				}
+	
 				// Send a reply back to the originator client
-				uint8_t data[1];
-				data[0] = buf[16];
+				uint8_t data[7];
+				data[0] = buf[16];								// Message number
+				data[1] = ((uint8_t) ((Time.now()) >> 24));		// Fourth byte - current time
+				data[2] = ((uint8_t) ((Time.now()) >> 16));		// Third byte
+				data[3] = ((uint8_t) ((Time.now()) >> 8));		// Second byte
+				data[4] = ((uint8_t) (Time.now()));				// First byte
+				data[5] = highByte(frequencyMinutes * 60);		// Time till next report
+				data[6] = lowByte(frequencyMinutes * 60);		
+
+				Log.info("Sent response to client message = %d, time = %u, next report = %u", data[0], (data[1] << 24 | data[2] << 16 | data[3] <<8 | data[4]), ( data[5] << 8 | data[6]));
 
 				if (manager.sendtoWait(data, sizeof(data), from) != RH_ROUTER_ERROR_NONE) Log.info("sendtoWait failed");
 				digitalWrite(blueLED,LOW);			// Done with the radio
+				// Here is where we will power down the LoRA radio module
 
 				state = REPORTING_STATE;
 			} 
 
-			if (publishSchedule.isScheduledTime()) state = CONNECTING_STATE;		// See Time section in setup for schedule
+			if ((Time.now() - startLoRAWindow) > 3600L) state = CONNECTING_STATE;	// This is a fail safe to make sure an off-line client won't prevent gatewat from checking in - and setting its clock
 
 		} break;
 
@@ -162,10 +208,10 @@ void loop() {
 			if (state != oldState) publishStateTransition();   // We will apply the back-offs before sending to ERROR state - so if we are here we will take action
 
 		  	char data[256];                         // Store the date in this character array - not global
-  			snprintf(data, sizeof(data), "{\"hourly\":%u, \"daily\":%u,\"battery\":%d,\"key1\":\"%s\",\"temp\":%d, \"resets\":%d, \"alerts\":%d,\"rssi\":%d, \"msg\":%d,\"timestamp\":%lu000}",((buf[5] << 8) | buf[6]), (buf[7] << 8 | buf[8]), buf[10], batteryContext[buf[11]], buf[9], buf[12], buf[13], ((buf[14] << 8 | buf[15]) - 65535), buf[16], Time.now());
+  			snprintf(data, sizeof(data), "{\"nodeid\":%u, \"hourly\":%u, \"daily\":%u,\"battery\":%d,\"key1\":\"%s\",\"temp\":%d, \"resets\":%d, \"alerts\":%d,\"rssi\":%d, \"msg\":%d,\"timestamp\":%lu000}",(buf[2] << 8 | buf[3]), (buf[5] << 8 | buf[6]), (buf[7] << 8 | buf[8]), buf[10], batteryContext[buf[11]], buf[9], buf[12], buf[13], ((buf[14] << 8 | buf[15]) - 65535), buf[16], Time.now());
   			PublishQueuePosix::instance().publish("Ubidots-LoRA-Hook-v1", data, PRIVATE | WITH_ACK);
 
-			state = IDLE_STATE;
+			state = CONNECTING_STATE;
 		} break;
 
 		case CONNECTING_STATE:
@@ -173,22 +219,28 @@ void loop() {
 			Particle.connect();
 			if (waitFor(Particle.connected, 600000)) {
 				lastConnectTime = Time.now();
-				stayAwakeTimer.reset();				// Start a 90 second clock to disconnect
-				state = IDLE_STATE;
+				if (lowPowerMode) state = DISCONNECTING_STATE;
+				else state = SLEEPING_STATE; 
 			}
 		break;
+
+		case DISCONNECTING_STATE: {
+			if (state != oldState) publishStateTransition();  // We will apply the back-offs before sending to ERROR state - so if we are here we will take action
+			static time_t stayConnectedWindow = Time.now();
+
+			if (Time.now() - stayConnectedWindow > 90) {
+				Log.info("Disconnecting from Particle / Cellular");
+				Particle.disconnect();
+				delay(2000);
+				Cellular.off();
+				waitFor(Cellular.isOff,10000);
+				state = SLEEPING_STATE;
+			}
+		} break;
 	}
 
 	PublishQueuePosix::instance().loop();           // Check to see if we need to tend to the message queue
 
-	if (disconnectFlag) {
-		Log.info("Disconnecting from Particle / Cellular");
-		Particle.disconnect();
-		delay(2000);
-		Cellular.off();
-		waitFor(Cellular.isOff,10000);
-		disconnectFlag = false;
-	}
 }
 
 /**
@@ -212,9 +264,57 @@ void publishStateTransition(void)
 }
 
 /**
- * @brief Interrupt Service Routine for the stay awake timer
- * 
+ * @brief Sets the how often the device will report data in minutes.
+ *
+ * @details Extracts the integer from the string passed in, and sets the closing time of the facility
+ * based on this input. Fails if the input is invalid.
+ *
+ * @param command A string indicating the number of minutes between reporting events.  Note, this function
+ * sets an interim value for reporting frequency which takes effect once sent to a new node.
+ *
+ * @return 1 if able to successfully take action, 0 if invalid command
  */
-void stayAwakeTimerISR() {
-	disconnectFlag = true;
+int setFrequency(String command)
+{
+  char * pEND;
+  char data[256];
+  int tempTime = strtol(command,&pEND,10);                       // Looks for the first integer and interprets it
+  if ((tempTime < 0) || (tempTime > 120)) return 0;   // Make sure it falls in a valid range or send a "fail" result
+  frequencyMinutes = tempTime;
+  snprintf(data, sizeof(data), "Report frequency set to %i minutes",frequencyMinutes);
+  Log.info(data);
+  if (Particle.connected()) Particle.publish("Time",data, PRIVATE);
+  return 1;
 }
+
+/**
+ * @brief Toggles the device into low power mode based on the input command.
+ *
+ * @details If the command is "1", sets the device into low power mode. If the command is "0",
+ * sets the device into normal mode. Fails if neither of these are the inputs.
+ *
+ * @param command A string indicating whether to set the device into low power mode or into normal mode.
+ * Low power mode will enable sleep and only listen at specific times for reports.  Non-low power mode is always connected
+ * and is always listening for reports.  
+ *
+ * @return 1 if able to successfully take action, 0 if invalid command
+ */
+int setLowPowerMode(String command)                                   // This is where we can put the device into low power mode if needed
+{
+  if (command != "1" && command != "0") return 0;                     // Before we begin, let's make sure we have a valid input
+  if (command == "1")                                                 // Command calls for setting lowPowerMode
+  {
+    lowPowerMode = true;
+    Log.info("Set Low Power Mode");
+    if (Particle.connected()) Particle.publish("Mode",(lowPowerMode) ? "Low Power" :"Not Low Power", PRIVATE);
+  }
+  else if (command == "0")                                            // Command calls for clearing lowPowerMode
+  {
+    lowPowerMode = false;
+    Log.info("Cleared Low Power Mode");
+    if (Particle.connected()) Particle.publish("Mode",(lowPowerMode) ? "Low Power" :"Not Low Power", PRIVATE);
+  }
+  return 1;
+}
+
+
